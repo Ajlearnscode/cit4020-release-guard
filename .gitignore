@@ -1,0 +1,11 @@
+.venv/
+*.pyc
+secrets/
+release_log.jsonl
+scratch/
+evidence/
+release_A/manifest.json
+release_A/signature.sig
+verifier/
+*.zip
+*.mp4
