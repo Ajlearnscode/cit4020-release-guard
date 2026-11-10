@@ -357,13 +357,13 @@ def check_all_stages(args, record):
     except InvalidSignature:
         raise ReleaseRejected("BAD_SIGNATURE")
 
-    # ---------- Stage 4: are all manifest paths safe? ----------
-    # (We never open a manifest path directly; this is still checked first.)
+    # stage 4, are all manifest paths safe? 
+    # (We never open a manifest path directly. This is still checked first.)
     for item in files:
         if not safe_manifest_path(item["path"]):
             raise ReleaseRejected("UNSAFE_PATH")
 
-    # ---------- Stage 5: do the real files match the manifest exactly? ----------
+    # stage 5, do the real files match the manifest exactly?
     try:
         actual = dict(collect_payload(release_dir / "payload"))   # {path: hash}
     except PayloadError as e:
