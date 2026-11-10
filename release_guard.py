@@ -13,28 +13,35 @@ import hashlib
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 class PayloadError(Exception):
     pass
 
+# For verification
+class ReleaseRejected(Exception):
+    def __init__(self, reason): 
+        self.reason = reason #assigning the reason of the rejection
 
-# 4.3.1 Work out the SHA-256 fingerprint of one file
+# Work out the SHA-256 fingerprint of one file
 def sha256_file(path):
     with open(path, "rb") as f:
         data = f.read()
     return hashlib.sha256(data).hexdigest()
 
 
-# 4.3.2 Find every file in the payload folder and fingerprint each one
+# Find every file in the payload folder and fingerprint each one
 def collect_payload(payload_dir):
     payload_dir = Path(payload_dir)
 
-    # 4.3.4 The folder must exist
+    #The folder must exist
     if not payload_dir.is_dir():
         raise PayloadError("MISSING_PAYLOAD")
 
     results = []
     for item in payload_dir.rglob("*"):
-        # 4.3.3 Reject symbolic links
+        # Reject symbolic links
         if item.is_symlink():
             raise PayloadError("UNSAFE_PAYLOAD")
         if item.is_file():
@@ -44,7 +51,7 @@ def collect_payload(payload_dir):
             # not a link, file or folder, so it is an unusual type
             raise PayloadError("UNSAFE_PAYLOAD")
 
-    # 4.3.4 An empty folder is also a failure
+    # An empty folder is also a failure
     if len(results) == 0:
         raise PayloadError("MISSING_PAYLOAD")
 
@@ -130,7 +137,7 @@ def run_setup(args):
         return 1
 
     # Success message that prints locations only and never the actual key contents.
-    print("SETUP OK for publisher'" + publisher_id + "'")
+    print("SETUP OK for publisher '" + publisher_id + "'")
     print("  Encrypted private key: " + str(private_path))
     print("  Public key:            " + str(public_path))
     print("  Trust registry:        " + str(registry_path))
@@ -152,7 +159,7 @@ def log_sign(args, result, reason):
 
 
 def sign_fail(args, reason):
-    print("Sign Failed: " + reason) # dsiplay the reason why the sign failed
+    print("SIGN FAILED: " + reason) # dsiplay the reason why the sign failed
     log_sign(args, "FAILED", reason) #log the failure that has occured
     return 1
 
@@ -240,10 +247,162 @@ def run_sign(args):
     log_sign(args, "SIGNED", "OK")
     return 0
 
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+# A manifest path is safe only if it is a plain relative path with no tricks
+def safe_manifest_path(raw):
+    if not isinstance(raw, str) or raw == "":
+        return False
+    if raw.startswith("/"):        # absolute path
+        return False
+    if ".." in raw:                # tries to climb out of payload/
+        return False
+    if "\\" in raw or ":" in raw:  # backslashes and drive letters like C:
+        return False
+    for part in raw.split("/"):    # no empty or "." pieces, e.g. "a//b" or "./a"
+        if part == "" or part == ".":
+            return False
+    return True
+
+# Runs the five checks IN ORDER. The first failure raises ReleaseRejected.
+def check_all_stages(args, record):
+    release_dir = Path(args.release)
+    workspace = Path(args.workspace)
+
+    # ---------- Stage 1: manifest and signature files exist and are well formed ----------
+    manifest_path = release_dir / "manifest.json"
+    signature_path = release_dir / "signature.sig"
+
+    if not manifest_path.is_file() or not signature_path.is_file():
+        raise ReleaseRejected("INVALID_MANIFEST")
+
+    try:
+        # read as BYTES and keep them exactly as they are (stage 3 needs these)
+        with open(manifest_path, "rb") as f:
+            manifest_bytes = f.read()
+        with open(signature_path, "rb") as f:
+            signature_bytes = f.read()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, ValueError):
+        raise ReleaseRejected("INVALID_MANIFEST")
+
+    if not isinstance(manifest, dict):
+        raise ReleaseRejected("INVALID_MANIFEST")
+
+    publisher_id = manifest.get("publisher_id")
+    release_name = manifest.get("release_name")
+    files = manifest.get("files")
+
+    if not isinstance(publisher_id, str) or publisher_id == "":
+        raise ReleaseRejected("INVALID_MANIFEST")
+    if not isinstance(release_name, str) or release_name == "":
+        raise ReleaseRejected("INVALID_MANIFEST")
+    if not isinstance(files, list):
+        raise ReleaseRejected("INVALID_MANIFEST")
+
+    seen_paths = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise ReleaseRejected("INVALID_MANIFEST")
+        path = item.get("path")
+        digest = item.get("sha256")
+        if not isinstance(path, str) or not isinstance(digest, str):
+            raise ReleaseRejected("INVALID_MANIFEST")
+        # a sha256 hash is exactly 64 lowercase hex characters
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ReleaseRejected("INVALID_MANIFEST")
+        if path in seen_paths:     # the same file listed twice
+            raise ReleaseRejected("INVALID_MANIFEST")
+        seen_paths.add(path)
+
+    record["publisher_id"] = publisher_id   # now the log can name the publisher
+
+    # ---------- Stage 2: is the publisher trusted and enabled? ----------
+    registry_path = workspace / "verifier" / "trusted_publishers.json"
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+        publishers = registry["publishers"]
+        if not isinstance(publishers, list):
+            raise ValueError("publishers must be a list")
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ReleaseRejected("TRUST_STORE_ERROR")
+
+    entry = None
+    for candidate in publishers:
+        if isinstance(candidate, dict) and candidate.get("publisher_id") == publisher_id:
+            entry = candidate
+    if entry is None:
+        raise ReleaseRejected("UNKNOWN_PUBLISHER")
+    if entry.get("enabled") is not True:     # disabled BEFORE any signature check
+        raise ReleaseRejected("PUBLISHER_DISABLED")
+
+    # ---------- Stage 3: is the signature valid? ----------
+    # The public key comes from OUR registry, never from the release folder.
+    key_path = entry.get("public_key_path")
+    if not isinstance(key_path, str):
+        raise ReleaseRejected("TRUST_STORE_ERROR")
+    try:
+        with open(workspace / key_path, "rb") as f:
+            public_key = serialization.load_pem_public_key(f.read())
+    except (OSError, ValueError):
+        raise ReleaseRejected("TRUST_STORE_ERROR")
+    if not isinstance(public_key, Ed25519PublicKey):
+        raise ReleaseRejected("TRUST_STORE_ERROR")
+
+    try:
+        # check the signature against the ORIGINAL manifest bytes from stage 1
+        public_key.verify(signature_bytes, manifest_bytes)
+    except InvalidSignature:
+        raise ReleaseRejected("BAD_SIGNATURE")
+
+    # ---------- Stage 4: are all manifest paths safe? ----------
+    # (We never open a manifest path directly; this is still checked first.)
+    for item in files:
+        if not safe_manifest_path(item["path"]):
+            raise ReleaseRejected("UNSAFE_PATH")
+
+    # ---------- Stage 5: do the real files match the manifest exactly? ----------
+    try:
+        actual = dict(collect_payload(release_dir / "payload"))   # {path: hash}
+    except PayloadError as e:
+        if str(e) == "UNSAFE_PAYLOAD":      # symbolic link or odd file type
+            raise ReleaseRejected("UNSAFE_PATH")
+        raise ReleaseRejected("MISSING_FILE")   # payload folder missing or empty
+
+    listed = {}
+    for item in files:
+        listed[item["path"]] = item["sha256"]
+
+    for path in sorted(listed):             # a listed file is absent
+        if path not in actual:
+            raise ReleaseRejected("MISSING_FILE")
+    for path in sorted(actual):             # a real file is not listed
+        if path not in listed:
+            raise ReleaseRejected("EXTRA_FILE")
+    for path in sorted(listed):             # a file's contents changed
+        if actual[path] != listed[path]:
+            raise ReleaseRejected("HASH_MISMATCH")
+
 # Method used to run the verification of signed packages
 def run_verify(args):
-    print("Verify is not yet coinfigured")
-    return 0
+    record = {"utc_time": now_utc(), "operation": "verify",
+                "release_folder": str(args.release), "publisher_id": None}
+    try:
+        check_all_stages(args, record)
+        record.update(result="ACCEPTED", reason="OK")
+        code = 0
+    except ReleaseRejected as e:
+        record.update(result="REJECTED", reason = e.reason)
+        code = 1
+    except Exception:
+        # Safety net: any unexpected crash is a rejection, never an acceptance
+        record.update(result="REJECTED", reason="INTERNAL_ERROR")
+        code = 1
+    append_log(record)
+    print("ACCEPTED" if code == 0 else "REJECTED " + record["reason"])
+    return code
 
 
 def main():
